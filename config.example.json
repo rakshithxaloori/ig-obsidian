@@ -1,0 +1,52 @@
+{
+  "paths": {
+    "archive_dir": "~/archive/instagram/saved",
+    "vault_dir": "~/Documents/Obsidian/MyVault/instagram",
+    "collections_file": "./collections.json",
+    "locations_file": "./locations.json",
+    "notes_dir": "notes",
+    "media_dir": "media",
+    "exports_dir": "exports"
+  },
+  "download": {
+    "enabled": false,
+    "instagram_username": "your_username",
+    "instaloader_bin": "instaloader",
+    "dirname_pattern": "saved",
+    "filename_pattern": "{profile}/{date_utc:%Y-%m-%d_%H-%M-%S}_{shortcode}",
+    "metadata_template": "{caption}\\n\\nurl=https://www.instagram.com/p/{shortcode}/\\nowner={owner_username}\\ndate={date_utc}",
+    "extra_args": []
+  },
+  "transcription": {
+    "enabled": true,
+    "backend": "faster-whisper",
+    "model": "small",
+    "device": "cpu",
+    "compute_type": "int8",
+    "beam_size": 5,
+    "language": null,
+    "overwrite": false
+  },
+  "obsidian": {
+    "use_symlinks": true,
+    "embed_media": true,
+    "base_tags": ["instagram", "saved"]
+  },
+  "maps": {
+    "enabled": false,
+    "export_filename": "google-my-maps.csv",
+    "aggregate_by_location": true,
+    "caption_snippet_length": 240
+  },
+  "categorization": {
+    "enabled": false,
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "api_key_env": "OPENAI_API_KEY",
+    "taxonomy_file": "./taxonomy.json",
+    "overwrite": false,
+    "max_input_chars": 8000,
+    "fallback_category": "uncategorized",
+    "attach_category_tags": true
+  }
+}

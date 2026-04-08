@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local app state
+.DS_Store
+.claude/
+
+# Local config and data
+config.json
+collections.json
+locations.json
+taxonomy.json
+archive/
+vault/
+
+# Generated exports
+*.csv
+Obsidian

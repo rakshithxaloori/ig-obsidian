@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ig-obsidian"
+version = "0.1.0"
+description = "Sync Instaloader exports into an Obsidian-friendly archive with optional transcription."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "instaloader>=4.14",
+]
+
+[project.optional-dependencies]
+transcribe = [
+  "faster-whisper>=1.1.0",
+]
+categorize = [
+  "openai>=1.0.0",
+]
+
+[project.scripts]
+ig-obsidian = "ig_obsidian.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ig_obsidian*"]

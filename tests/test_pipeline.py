@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+from datetime import datetime
+import csv
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+from ig_obsidian.categorize import categorize_posts, load_taxonomy
+from ig_obsidian.collections import load_collection_map, normalize_shortcode
+from ig_obsidian.config import (
+    AppConfig,
+    CategorizationConfig,
+    ObsidianConfig,
+    PathsConfig,
+    TranscriptionConfig,
+)
+from ig_obsidian.cli import _build_parser, _load_posts
+from ig_obsidian.instagram import discover_posts, extract_shortcode_from_name
+from ig_obsidian.locations import attach_locations, export_google_maps_csv, load_location_overrides
+from ig_obsidian.models import CategoryResult
+from ig_obsidian.obsidian import write_notes
+
+
+class CliParsingTest(unittest.TestCase):
+    def test_config_is_accepted_after_subcommand(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(["sync", "--config", "config.json"])
+        self.assertEqual(args.command, "sync")
+        self.assertEqual(args.config, Path("config.json"))
+
+    def test_missing_archive_dir_is_created_on_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            config = AppConfig(
+                paths=PathsConfig(
+                    archive_dir=base / "missing-archive",
+                    vault_dir=base / "vault",
+                ),
+                transcription=TranscriptionConfig(enabled=False),
+                obsidian=ObsidianConfig(),
+            )
+
+            posts = _load_posts(config)
+            self.assertEqual(posts, [])
+            self.assertTrue(config.paths.archive_dir.exists())
+            self.assertTrue(config.paths.vault_dir.exists())
+            self.assertTrue(config.paths.notes_path.exists())
+            self.assertTrue(config.paths.media_path.exists())
+            self.assertTrue(config.paths.exports_path.exists())
+
+
+class CollectionsTest(unittest.TestCase):
+    def test_normalize_shortcode_from_url(self) -> None:
+        self.assertEqual(normalize_shortcode("https://www.instagram.com/reel/ABC123/"), "ABC123")
+
+    def test_load_collection_map_supports_both_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "collections.json"
+            path.write_text(
+                json.dumps({"travels": ["ABC123", "https://www.instagram.com/p/XYZ789/"]}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                load_collection_map(path),
+                {"ABC123": ["travels"], "XYZ789": ["travels"]},
+            )
+
+            path.write_text(json.dumps({"ABC123": "food"}), encoding="utf-8")
+            self.assertEqual(load_collection_map(path), {"ABC123": ["food"]})
+
+
+class CategorizationTest(unittest.TestCase):
+    def test_load_taxonomy_supports_object_and_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "taxonomy.json"
+            path.write_text(json.dumps({"travel": "Trip ideas"}), encoding="utf-8")
+            taxonomy = load_taxonomy(path, "uncategorized")
+            self.assertIn("travel", taxonomy.categories)
+            self.assertIn("uncategorized", taxonomy.categories)
+
+            path.write_text(json.dumps(["food", "shopping"]), encoding="utf-8")
+            taxonomy = load_taxonomy(path, "uncategorized")
+            self.assertEqual(taxonomy.names, ["food", "shopping", "uncategorized"])
+
+    def test_discover_posts_loads_existing_category_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "saved"
+            author_dir = root / "someuser"
+            author_dir.mkdir(parents=True)
+
+            (author_dir / "2026-04-08_12-01-02_ABC123.mp4").write_bytes(b"video")
+            (author_dir / "2026-04-08_12-01-02_ABC123.ai_categories.json").write_text(
+                json.dumps(
+                    {
+                        "primary_category": "travel",
+                        "secondary_categories": ["food"],
+                        "confidence": 0.9,
+                        "reasoning": "Travel reel with food recommendations.",
+                        "model": "gpt-4o-mini",
+                        "provider": "openai",
+                        "taxonomy_signature": "abc",
+                        "categorized_at": "2026-04-08T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            posts = discover_posts(root, {})
+            self.assertEqual(posts[0].category_result.primary_category, "travel")
+            self.assertEqual(posts[0].category_result.secondary_categories, ["food"])
+
+    def test_categorize_posts_writes_sidecars_with_fake_client(self) -> None:
+        class FakeResponses:
+            def create(self, **_: object) -> object:
+                return type(
+                    "FakeResponse",
+                    (),
+                    {
+                        "output_text": json.dumps(
+                            {
+                                "primary_category": "food",
+                                "secondary_categories": ["travel"],
+                                "confidence": 0.88,
+                                "reasoning": "Mostly restaurant-focused content.",
+                            }
+                        )
+                    },
+                )()
+
+        class FakeClient:
+            responses = FakeResponses()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            archive_dir = base / "archive" / "saved"
+            user_dir = archive_dir / "someuser"
+            user_dir.mkdir(parents=True)
+            video = user_dir / "2026-04-08_12-01-02_ABC123.mp4"
+            caption = user_dir / "2026-04-08_12-01-02_ABC123.txt"
+            video.write_bytes(b"video")
+            caption.write_text("Great cafe in Lisbon", encoding="utf-8")
+
+            taxonomy_path = base / "taxonomy.json"
+            taxonomy_path.write_text(
+                json.dumps({"food": "Restaurants and cafes", "travel": "Destinations"}),
+                encoding="utf-8",
+            )
+            taxonomy = load_taxonomy(taxonomy_path, "uncategorized")
+            posts = discover_posts(archive_dir, {})
+            written = categorize_posts(
+                posts,
+                CategorizationConfig(
+                    enabled=True,
+                    taxonomy_file=taxonomy_path,
+                    fallback_category="uncategorized",
+                ),
+                taxonomy,
+                client=FakeClient(),
+            )
+
+            self.assertEqual(written, 1)
+            self.assertEqual(posts[0].category_result.primary_category, "food")
+            self.assertTrue((user_dir / "2026-04-08_12-01-02_ABC123.ai_categories.json").exists())
+
+
+class InstagramDiscoveryTest(unittest.TestCase):
+    def test_extract_shortcode_from_instaloader_filename(self) -> None:
+        self.assertEqual(
+            extract_shortcode_from_name("2026-04-08_12-01-02_ABC123.mp4"),
+            "ABC123",
+        )
+        self.assertEqual(
+            extract_shortcode_from_name("2026-04-08_12-01-02_ABC123_1.jpg"),
+            "ABC123",
+        )
+
+    def test_discover_posts_reads_caption_and_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "saved"
+            author_dir = root / "someuser"
+            author_dir.mkdir(parents=True)
+
+            video = author_dir / "2026-04-08_12-01-02_ABC123.mp4"
+            caption = author_dir / "2026-04-08_12-01-02_ABC123.txt"
+            metadata = author_dir / "2026-04-08_12-01-02_ABC123.json"
+            transcript = author_dir / "2026-04-08_12-01-02_ABC123.transcript.txt"
+
+            video.write_bytes(b"video")
+            caption.write_text(
+                "A reel caption.\n\nurl=https://www.instagram.com/reel/ABC123/\nowner=someuser\ndate=2026-04-08T12:01:02",
+                encoding="utf-8",
+            )
+            metadata.write_text(
+                json.dumps({"product_type": "clips", "owner_username": "someuser"}),
+                encoding="utf-8",
+            )
+            transcript.write_text("Line one\nLine two\n", encoding="utf-8")
+
+            posts = discover_posts(root, {"ABC123": ["travels"]})
+            self.assertEqual(len(posts), 1)
+
+            post = posts[0]
+            self.assertEqual(post.shortcode, "ABC123")
+            self.assertEqual(post.author, "someuser")
+            self.assertEqual(post.kind, "reel")
+            self.assertEqual(post.collections, ["travels"])
+            self.assertEqual(post.caption, "A reel caption.")
+            self.assertEqual(post.transcript, "Line one\nLine two")
+            self.assertEqual(post.url, "https://www.instagram.com/reel/ABC123/")
+            self.assertEqual(post.date, datetime(2026, 4, 8, 12, 1, 2))
+
+    def test_discover_posts_dedupes_duplicate_shortcode_downloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "saved"
+            first_dir = root / "someuser"
+            second_dir = root / "retry"
+            first_dir.mkdir(parents=True)
+            second_dir.mkdir(parents=True)
+
+            first_video = first_dir / "2026-04-08_12-01-02_ABC123.mp4"
+            second_video = second_dir / "2026-04-09_12-01-02_ABC123.mp4"
+            metadata = second_dir / "2026-04-09_12-01-02_ABC123.json"
+
+            first_video.write_bytes(b"small")
+            second_video.write_bytes(b"this is the bigger duplicate file")
+            metadata.write_text(
+                json.dumps({"product_type": "clips", "owner_username": "someuser"}),
+                encoding="utf-8",
+            )
+
+            posts = discover_posts(root, {})
+            self.assertEqual(len(posts), 1)
+            self.assertEqual(posts[0].author, "someuser")
+            self.assertEqual(posts[0].media_files, [second_video])
+
+
+class NoteWritingTest(unittest.TestCase):
+    def test_write_notes_symlinks_media_and_renders_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            archive_dir = base / "archive" / "saved"
+            media_source_dir = archive_dir / "someuser"
+            media_source_dir.mkdir(parents=True)
+
+            video = media_source_dir / "2026-04-08_12-01-02_ABC123.mp4"
+            caption = media_source_dir / "2026-04-08_12-01-02_ABC123.txt"
+            metadata = media_source_dir / "2026-04-08_12-01-02_ABC123.json"
+            transcript = media_source_dir / "2026-04-08_12-01-02_ABC123.transcript.txt"
+
+            video.write_bytes(b"video")
+            caption.write_text("Caption", encoding="utf-8")
+            metadata.write_text(
+                json.dumps(
+                    {
+                        "product_type": "clips",
+                        "location": {
+                            "name": "Cafe Example",
+                            "address": "123 Example Street",
+                            "lat": 38.7223,
+                            "lng": -9.1393,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            transcript.write_text("Transcript body", encoding="utf-8")
+
+            config = AppConfig(
+                paths=PathsConfig(
+                    archive_dir=archive_dir,
+                    vault_dir=base / "vault",
+                    notes_dir="notes",
+                    media_dir="media",
+                ),
+                transcription=TranscriptionConfig(enabled=False),
+                obsidian=ObsidianConfig(use_symlinks=True, embed_media=True, base_tags=["instagram"]),
+            )
+
+            posts = discover_posts(archive_dir, {"ABC123": ["travels"]})
+            posts = attach_locations(posts, {})
+            posts[0].category_result = CategoryResult(
+                primary_category="travel",
+                secondary_categories=["food"],
+                confidence=0.84,
+                reasoning="Travel reel with dining recommendations.",
+                model="gpt-4o-mini",
+            )
+            written = write_notes(posts, config)
+            self.assertEqual(written, 1)
+
+            note_path = config.paths.notes_path / "2026-04-08_ABC123.md"
+            media_target = config.paths.media_path / "someuser" / video.name
+
+            self.assertTrue(note_path.exists())
+            self.assertTrue(media_target.is_symlink())
+
+            note_text = note_path.read_text(encoding="utf-8")
+            self.assertIn('shortcode: "ABC123"', note_text)
+            self.assertIn('saved_collection: "travels"', note_text)
+            self.assertIn("![[../media/someuser/2026-04-08_12-01-02_ABC123.mp4]]", note_text)
+            self.assertIn("## Transcript", note_text)
+            self.assertIn("## Locations", note_text)
+            self.assertIn("Cafe Example", note_text)
+            self.assertIn('ai_primary_category: "travel"', note_text)
+            self.assertIn('ai_secondary_categories:', note_text)
+            self.assertIn('"category/travel"', note_text)
+            self.assertIn("## AI Categories", note_text)
+
+
+class MapsExportTest(unittest.TestCase):
+    def test_export_google_maps_csv_aggregates_duplicate_locations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            archive_dir = base / "archive" / "saved"
+            user_dir = archive_dir / "someuser"
+            user_dir.mkdir(parents=True)
+
+            first_video = user_dir / "2026-04-08_12-01-02_ABC123.mp4"
+            second_video = user_dir / "2026-04-09_12-01-02_XYZ789.mp4"
+            first_video.write_bytes(b"video one")
+            second_video.write_bytes(b"video two")
+
+            (user_dir / "2026-04-08_12-01-02_ABC123.txt").write_text("First caption", encoding="utf-8")
+            (user_dir / "2026-04-09_12-01-02_XYZ789.txt").write_text("Second caption", encoding="utf-8")
+            location_payload = {
+                "product_type": "clips",
+                "location": {
+                    "name": "Cafe Example",
+                    "address": "123 Example Street",
+                    "lat": 38.7223,
+                    "lng": -9.1393,
+                },
+            }
+            (user_dir / "2026-04-08_12-01-02_ABC123.json").write_text(
+                json.dumps(location_payload),
+                encoding="utf-8",
+            )
+            (user_dir / "2026-04-09_12-01-02_XYZ789.json").write_text(
+                json.dumps(location_payload),
+                encoding="utf-8",
+            )
+
+            overrides_path = base / "locations.json"
+            overrides_path.write_text(
+                json.dumps(
+                    {
+                        "ABC123": {
+                            "name": "Cafe Example",
+                            "description": "Great brunch stop.",
+                            "latitude": 38.7223,
+                            "longitude": -9.1393,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            posts = discover_posts(archive_dir, {"ABC123": ["travels"], "XYZ789": ["food"]})
+            posts = attach_locations(posts, load_location_overrides(overrides_path))
+
+            output_path = base / "vault" / "exports" / "google-my-maps.csv"
+            written = export_google_maps_csv(posts, output_path)
+            self.assertEqual(written, 1)
+
+            with output_path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["Name"], "Cafe Example")
+            self.assertIn("Great brunch stop.", rows[0]["Description"])
+            self.assertIn("ABC123 by someuser", rows[0]["Description"])
+            self.assertIn("XYZ789 by someuser", rows[0]["Description"])
+            self.assertEqual(rows[0]["Latitude"], "38.722300")
+            self.assertEqual(rows[0]["Longitude"], "-9.139300")
+
+
+if __name__ == "__main__":
+    unittest.main()

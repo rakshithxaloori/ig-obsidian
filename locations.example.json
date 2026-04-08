@@ -1,0 +1,17 @@
+{
+  "ABC123": {
+    "name": "Cafe Example",
+    "description": "Good brunch spot from a saved reel.",
+    "address": "123 Example Street, Lisbon, Portugal",
+    "latitude": 38.7223,
+    "longitude": -9.1393
+  },
+  "XYZ789": [
+    {
+      "name": "Temple Viewpoint",
+      "description": "Sunrise viewpoint.",
+      "latitude": 13.4125,
+      "longitude": 103.8667
+    }
+  ]
+}
