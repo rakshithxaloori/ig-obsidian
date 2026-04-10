@@ -22,6 +22,14 @@ DATE_PREFIX_RE = re.compile(
 )
 
 
+def _is_ignored_archive_path(root: Path, path: Path) -> bool:
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = path.parts
+    return any(part.startswith(".") for part in parts)
+
+
 def _strip_known_suffixes(filename: str) -> str:
     suffixes = [CATEGORY_SUFFIX, TRANSCRIPT_SUFFIX, *METADATA_SUFFIXES, ".txt", *sorted(MEDIA_EXTENSIONS)]
     for suffix in sorted(suffixes, key=len, reverse=True):
@@ -84,7 +92,7 @@ def _load_metadata(path: Path) -> Dict[str, Any]:
             with lzma.open(path, "rt", encoding="utf-8") as handle:
                 return json.load(handle)
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, lzma.LZMAError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, lzma.LZMAError):
         return {}
 
 
@@ -176,11 +184,20 @@ def _join_text_files(paths: Iterable[Path]) -> str:
     chunks = []
     seen = set()
     for path in sorted(paths):
-        text = path.read_text(encoding="utf-8").strip()
+        text = _read_text_file(path).strip()
         if text and text not in seen:
             chunks.append(text)
             seen.add(text)
     return "\n\n".join(chunks)
+
+
+def _read_text_file(path: Path) -> str:
+    for encoding in ("utf-8", "utf-8-sig"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def _preferred_metadata_path(current: Optional[Path], candidate: Path) -> Path:
@@ -242,6 +259,8 @@ def discover_posts(root: Path, collection_map: Dict[str, list[str]]) -> list[Ins
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
+        if _is_ignored_archive_path(root, path):
+            continue
 
         shortcode = extract_shortcode_from_name(path.name)
         if not shortcode:
@@ -286,7 +305,7 @@ def discover_posts(root: Path, collection_map: Dict[str, list[str]]) -> list[Ins
             post.category_result = load_category_result_from_path(post.category_file)
 
         if post.caption_file is not None:
-            raw_caption = post.caption_file.read_text(encoding="utf-8")
+            raw_caption = _read_text_file(post.caption_file)
             post.caption, footer_meta = _split_caption_and_sidecar_metadata(raw_caption)
 
         if not post.caption:

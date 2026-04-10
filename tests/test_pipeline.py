@@ -235,6 +235,28 @@ class InstagramDiscoveryTest(unittest.TestCase):
             self.assertEqual(posts[0].author, "someuser")
             self.assertEqual(posts[0].media_files, [second_video])
 
+    def test_discover_posts_ignores_hidden_mac_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "saved"
+            author_dir = root / "someuser"
+            author_dir.mkdir(parents=True)
+
+            video = author_dir / "2026-04-08_12-01-02_ABC123.mp4"
+            caption = author_dir / "2026-04-08_12-01-02_ABC123.txt"
+            hidden_video = author_dir / "._2026-04-08_12-01-02_ABC123.mp4"
+            hidden_caption = author_dir / "._2026-04-08_12-01-02_ABC123.txt"
+
+            video.write_bytes(b"real video")
+            caption.write_text("Real caption", encoding="utf-8")
+            hidden_video.write_bytes(b"this sidecar should never win duplicate selection")
+            hidden_caption.write_bytes(b"AppleDouble\x00\xb0")
+
+            posts = discover_posts(root, {})
+
+            self.assertEqual(len(posts), 1)
+            self.assertEqual(posts[0].media_files, [video])
+            self.assertEqual(posts[0].caption, "Real caption")
+
 
 class NoteWritingTest(unittest.TestCase):
     def test_write_notes_symlinks_media_and_renders_markdown(self) -> None:
