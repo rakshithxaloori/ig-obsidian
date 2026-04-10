@@ -4,8 +4,11 @@ from datetime import datetime
 import csv
 import json
 from pathlib import Path
+import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 from ig_obsidian.categorize import categorize_posts, load_taxonomy
 from ig_obsidian.collections import load_collection_map, normalize_shortcode
@@ -19,8 +22,13 @@ from ig_obsidian.config import (
 from ig_obsidian.cli import _build_parser, _load_posts
 from ig_obsidian.instagram import discover_posts, extract_shortcode_from_name
 from ig_obsidian.locations import attach_locations, export_google_maps_csv, load_location_overrides
-from ig_obsidian.models import CategoryResult
+from ig_obsidian.models import CategoryResult, InstagramPost
 from ig_obsidian.obsidian import write_notes
+from ig_obsidian.transcribe import (
+    transcript_error_path_for_video,
+    transcript_path_for_video,
+    transcribe_posts,
+)
 
 
 class CliParsingTest(unittest.TestCase):
@@ -256,6 +264,89 @@ class InstagramDiscoveryTest(unittest.TestCase):
             self.assertEqual(len(posts), 1)
             self.assertEqual(posts[0].media_files, [video])
             self.assertEqual(posts[0].caption, "Real caption")
+
+
+class TranscriptionTest(unittest.TestCase):
+    def test_transcribe_posts_writes_failure_marker_and_continues(self) -> None:
+        class FakeSegment:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+        class FakeWhisperModel:
+            def __init__(self, *_: object, **__: object) -> None:
+                pass
+
+            def transcribe(self, path: str, **_: object) -> tuple[list[FakeSegment], None]:
+                if path.endswith("BAD123.mp4"):
+                    raise IndexError("tuple index out of range")
+                return ([FakeSegment("hello from whisper")], None)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            bad_video = root / "2026-04-08_12-01-02_BAD123.mp4"
+            good_video = root / "2026-04-08_12-01-02_GOOD456.mp4"
+            bad_video.write_bytes(b"bad video")
+            good_video.write_bytes(b"good video")
+
+            posts = [
+                InstagramPost(shortcode="BAD123", author="someuser", media_files=[bad_video], video_files=[bad_video]),
+                InstagramPost(
+                    shortcode="GOOD456",
+                    author="someuser",
+                    media_files=[good_video],
+                    video_files=[good_video],
+                ),
+            ]
+            progress: list[str] = []
+
+            with mock.patch.dict(
+                sys.modules,
+                {"faster_whisper": types.SimpleNamespace(WhisperModel=FakeWhisperModel)},
+            ):
+                created = transcribe_posts(
+                    posts,
+                    TranscriptionConfig(enabled=True),
+                    progress=progress.append,
+                )
+
+            self.assertEqual(created, 1)
+            self.assertEqual(
+                transcript_path_for_video(good_video).read_text(encoding="utf-8"),
+                "hello from whisper\n",
+            )
+            self.assertEqual(
+                transcript_error_path_for_video(bad_video).read_text(encoding="utf-8"),
+                "IndexError: tuple index out of range\n",
+            )
+            self.assertTrue(any("Failed 2026-04-08_12-01-02_BAD123.mp4" in message for message in progress))
+            self.assertTrue(any("Transcription summary: 1 transcript file(s), 0 empty marker(s), 1 failure marker(s)." == message for message in progress))
+
+    def test_transcribe_posts_skips_existing_failure_marker_on_rerun(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            video = root / "2026-04-08_12-01-02_BAD123.mp4"
+            video.write_bytes(b"bad video")
+            transcript_error_path_for_video(video).write_text(
+                "IndexError: tuple index out of range\n",
+                encoding="utf-8",
+            )
+
+            posts = [
+                InstagramPost(shortcode="BAD123", author="someuser", media_files=[video], video_files=[video])
+            ]
+            progress: list[str] = []
+
+            created = transcribe_posts(
+                posts,
+                TranscriptionConfig(enabled=True),
+                progress=progress.append,
+            )
+
+            self.assertEqual(created, 0)
+            self.assertIn(
+                "No videos need transcription. Existing transcripts skipped: 0. Previous failures skipped: 1.",
+                progress,
+            )
 
 
 class NoteWritingTest(unittest.TestCase):
