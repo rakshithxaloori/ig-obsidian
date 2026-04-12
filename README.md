@@ -1,6 +1,6 @@
 # IG Collection to Obsidian
 
-Small Python CLI for turning an Instaloader `:saved` archive into Obsidian notes with linked media, saved-collection tags, optional Faster-Whisper transcripts, and optional AI categorization.
+Small Python CLI for turning an Instaloader `:saved` archive into Obsidian notes with linked media, saved-collection tags, optional Faster-Whisper transcripts, and optional Ollama categorization.
 
 ## What It Does
 
@@ -41,7 +41,7 @@ vault/
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e '.[transcribe,categorize]'
+pip install -e '.[transcribe]'
 cp config.example.json config.json
 cp collections.example.json collections.json
 cp locations.example.json locations.json
@@ -61,6 +61,9 @@ Edit `config.json`:
 - `download.instagram_username`: your Instagram username if you want `ig-obsidian download` / `sync --download` to run Instaloader for you
 - `paths.locations_file`: optional per-shortcode location overrides and descriptions for Google Maps export
 - `categorization.taxonomy_file`: your category taxonomy for AI classification
+- `categorization.model`: Ollama model name, defaults to `gemma4:e4b`
+- `categorization.base_url`: Ollama server URL, overridden by `OLLAMA_HOST` when set
+- `categorization.dynamic_location_categories`: generic categories that should expand to `<category>/<location>` when the post is clearly about a place
 
 ## Collection Mapping
 
@@ -104,7 +107,7 @@ If Instagram metadata already contains a location, the tool will pick it up auto
 
 ## AI Taxonomy
 
-`taxonomy.json` defines the categories the model is allowed to use. It can be a list of names or an object of `name -> description`. Descriptions produce better results.
+`taxonomy.json` defines the generic categories the model is allowed to use. It can be a list of names or an object of `name -> description`. Descriptions produce better results.
 
 ```json
 {
@@ -114,13 +117,18 @@ If Instagram metadata already contains a location, the tool will pick it up auto
 }
 ```
 
+By default, `travel` and `food` are also treated as location-aware roots. When a saved post is clearly about a place, the model can return categories like `travel/Kyoto, Japan` or `food/Lisbon, Portugal`. Other content still stays in the generic taxonomy. If you want a strict fixed taxonomy again, set `categorization.dynamic_location_categories` to `[]`.
+
 When categorization is enabled, the tool:
 
 - reads caption/transcript/location context
-- classifies into your taxonomy with OpenAI
+- classifies into your taxonomy with Ollama tool calling
+- uses dynamic `category/location` values for configured location-aware categories when a place is clear
 - writes a `.ai_categories.json` sidecar next to the source files
 - skips already-classified posts on future reruns unless `overwrite` is true
 - writes the chosen categories into note frontmatter and an `## AI Categories` section
+
+Categorization uses the local Ollama `/api/chat` endpoint with `think=false` to avoid extra reasoning latency during classification. `categorization.model` defaults to `gemma4:e4b`, and `OLLAMA_MODEL` / `OLLAMA_HOST` override the config at runtime.
 
 ## Usage
 
@@ -169,9 +177,17 @@ ig-obsidian download --config config.json
 ## Notes
 
 - `download` shells out to the `instaloader` CLI. The package is installed as a dependency, but the login flow is still interactive.
-- Transcription only supports `faster-whisper` right now. That keeps the implementation simpler and avoids the extra `ffmpeg` requirement from `openai-whisper`.
+- Transcription only supports `faster-whisper` right now. That keeps the implementation simpler and avoids the extra `ffmpeg` requirement from the reference Whisper package.
 - The first transcription run may pause on model initialization while `faster-whisper` downloads model files from Hugging Face. The CLI now prints that step explicitly.
-- AI categorization currently supports OpenAI via the Responses API and needs `OPENAI_API_KEY` set in your environment.
+- AI categorization uses Ollama's local chat API with a `categorize_saved_post` function schema. Make sure your Ollama server is running and the model is available, for example:
+
+```bash
+ollama pull gemma4:e4b
+export OLLAMA_MODEL=gemma4:e4b
+ig-obsidian categorize --config config.json
+```
+
+- Ollama powers taxonomy classification only. Video transcription still uses `faster-whisper`.
 - Media is mirrored into the Obsidian folder using symlinks by default. Switch `obsidian.use_symlinks` to `false` if you want copies instead.
 - Notes are regenerated deterministically. Re-running `build` or `sync` updates the markdown in place.
 - Posts are deduped by Instagram shortcode, and per-post media variants are deduped by their sidecar slot so reruns do not create extra notes for the same reel.

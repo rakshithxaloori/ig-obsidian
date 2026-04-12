@@ -192,6 +192,7 @@ def _handle_categorize(config: AppConfig, force: bool) -> None:
     taxonomy = load_taxonomy(
         config.categorization.taxonomy_file,
         config.categorization.fallback_category,
+        config.categorization.dynamic_location_categories,
     )
     _log(
         f"Loaded taxonomy with {len(taxonomy.names)} categories from "
@@ -237,6 +238,7 @@ def _handle_sync(config: AppConfig, force_download: bool, skip_transcribe: bool,
         taxonomy = load_taxonomy(
             config.categorization.taxonomy_file,
             config.categorization.fallback_category,
+            config.categorization.dynamic_location_categories,
         )
         _log(
             f"Loaded taxonomy with {len(taxonomy.names)} categories from "

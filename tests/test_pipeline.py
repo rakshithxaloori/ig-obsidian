@@ -84,13 +84,15 @@ class CategorizationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "taxonomy.json"
             path.write_text(json.dumps({"travel": "Trip ideas"}), encoding="utf-8")
-            taxonomy = load_taxonomy(path, "uncategorized")
+            taxonomy = load_taxonomy(path, "uncategorized", ["travel", "food"])
             self.assertIn("travel", taxonomy.categories)
             self.assertIn("uncategorized", taxonomy.categories)
+            self.assertEqual(taxonomy.dynamic_location_categories, ("travel",))
 
             path.write_text(json.dumps(["food", "shopping"]), encoding="utf-8")
-            taxonomy = load_taxonomy(path, "uncategorized")
+            taxonomy = load_taxonomy(path, "uncategorized", ["travel", "food"])
             self.assertEqual(taxonomy.names, ["food", "shopping", "uncategorized"])
+            self.assertEqual(taxonomy.dynamic_location_categories, ("food",))
 
     def test_discover_posts_loads_existing_category_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -106,8 +108,8 @@ class CategorizationTest(unittest.TestCase):
                         "secondary_categories": ["food"],
                         "confidence": 0.9,
                         "reasoning": "Travel reel with food recommendations.",
-                        "model": "gpt-4o-mini",
-                        "provider": "openai",
+                        "model": "gemma4:e4b",
+                        "provider": "ollama",
                         "taxonomy_signature": "abc",
                         "categorized_at": "2026-04-08T00:00:00+00:00",
                     }
@@ -120,25 +122,29 @@ class CategorizationTest(unittest.TestCase):
             self.assertEqual(posts[0].category_result.secondary_categories, ["food"])
 
     def test_categorize_posts_writes_sidecars_with_fake_client(self) -> None:
-        class FakeResponses:
-            def create(self, **_: object) -> object:
-                return type(
-                    "FakeResponse",
-                    (),
-                    {
-                        "output_text": json.dumps(
-                            {
-                                "primary_category": "food",
-                                "secondary_categories": ["travel"],
-                                "confidence": 0.88,
-                                "reasoning": "Mostly restaurant-focused content.",
-                            }
-                        )
-                    },
-                )()
-
         class FakeClient:
-            responses = FakeResponses()
+            def __init__(self) -> None:
+                self.requests: list[dict[str, object]] = []
+
+            def chat(self, payload: dict[str, object]) -> dict[str, object]:
+                self.requests.append(payload)
+                return {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "categorize_saved_post",
+                                    "arguments": {
+                                        "primary_category": "food/Lisbon, Portugal",
+                                        "secondary_categories": ["travel/Lisbon, Portugal"],
+                                        "confidence": 0.88,
+                                        "reasoning": "Mostly restaurant-focused content.",
+                                    },
+                                }
+                            }
+                        ]
+                    }
+                }
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = Path(tmp_dir)
@@ -155,7 +161,66 @@ class CategorizationTest(unittest.TestCase):
                 json.dumps({"food": "Restaurants and cafes", "travel": "Destinations"}),
                 encoding="utf-8",
             )
-            taxonomy = load_taxonomy(taxonomy_path, "uncategorized")
+            dynamic_roots = ["travel", "food"]
+            taxonomy = load_taxonomy(taxonomy_path, "uncategorized", dynamic_roots)
+            posts = discover_posts(archive_dir, {})
+            client = FakeClient()
+            with mock.patch.dict("os.environ", {"OLLAMA_MODEL": "gemma4:e4b"}, clear=False):
+                written = categorize_posts(
+                    posts,
+                    CategorizationConfig(
+                        enabled=True,
+                        taxonomy_file=taxonomy_path,
+                        fallback_category="uncategorized",
+                        dynamic_location_categories=dynamic_roots,
+                    ),
+                    taxonomy,
+                    client=client,
+                )
+
+            self.assertEqual(written, 1)
+            self.assertEqual(posts[0].category_result.primary_category, "food/Lisbon, Portugal")
+            self.assertEqual(posts[0].category_result.secondary_categories, ["travel/Lisbon, Portugal"])
+            self.assertEqual(posts[0].category_result.model, "gemma4:e4b")
+            self.assertEqual(posts[0].category_result.provider, "ollama")
+            self.assertEqual(client.requests[0]["model"], "gemma4:e4b")
+            self.assertFalse(client.requests[0]["think"])
+            self.assertIn("tools", client.requests[0])
+            self.assertTrue((user_dir / "2026-04-08_12-01-02_ABC123.ai_categories.json").exists())
+
+    def test_categorize_posts_accepts_raw_json_fallback(self) -> None:
+        class FakeClient:
+            def chat(self, _: dict[str, object]) -> dict[str, object]:
+                return {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "primary_category": "travel",
+                                "secondary_categories": ["food"],
+                                "confidence": 0.72,
+                                "reasoning": "Trip-focused reel with food suggestions.",
+                            }
+                        )
+                    }
+                }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            archive_dir = base / "archive" / "saved"
+            user_dir = archive_dir / "someuser"
+            user_dir.mkdir(parents=True)
+            video = user_dir / "2026-04-08_12-01-02_ABC123.mp4"
+            caption = user_dir / "2026-04-08_12-01-02_ABC123.txt"
+            video.write_bytes(b"video")
+            caption.write_text("Weekend trip with great pastries", encoding="utf-8")
+
+            taxonomy_path = base / "taxonomy.json"
+            taxonomy_path.write_text(
+                json.dumps({"food": "Restaurants and cafes", "travel": "Destinations"}),
+                encoding="utf-8",
+            )
+            dynamic_roots = ["travel", "food"]
+            taxonomy = load_taxonomy(taxonomy_path, "uncategorized", dynamic_roots)
             posts = discover_posts(archive_dir, {})
             written = categorize_posts(
                 posts,
@@ -163,14 +228,15 @@ class CategorizationTest(unittest.TestCase):
                     enabled=True,
                     taxonomy_file=taxonomy_path,
                     fallback_category="uncategorized",
+                    dynamic_location_categories=dynamic_roots,
                 ),
                 taxonomy,
                 client=FakeClient(),
             )
 
             self.assertEqual(written, 1)
-            self.assertEqual(posts[0].category_result.primary_category, "food")
-            self.assertTrue((user_dir / "2026-04-08_12-01-02_ABC123.ai_categories.json").exists())
+            self.assertEqual(posts[0].category_result.primary_category, "travel")
+            self.assertEqual(posts[0].category_result.secondary_categories, ["food"])
 
 
 class InstagramDiscoveryTest(unittest.TestCase):
@@ -394,11 +460,11 @@ class NoteWritingTest(unittest.TestCase):
             posts = discover_posts(archive_dir, {"ABC123": ["travels"]})
             posts = attach_locations(posts, {})
             posts[0].category_result = CategoryResult(
-                primary_category="travel",
-                secondary_categories=["food"],
+                primary_category="food/Lisbon, Portugal",
+                secondary_categories=["travel/Lisbon, Portugal"],
                 confidence=0.84,
                 reasoning="Travel reel with dining recommendations.",
-                model="gpt-4o-mini",
+                model="gemma4:e4b",
             )
             written = write_notes(posts, config)
             self.assertEqual(written, 1)
@@ -416,9 +482,10 @@ class NoteWritingTest(unittest.TestCase):
             self.assertIn("## Transcript", note_text)
             self.assertIn("## Locations", note_text)
             self.assertIn("Cafe Example", note_text)
-            self.assertIn('ai_primary_category: "travel"', note_text)
+            self.assertIn('ai_primary_category: "food/Lisbon, Portugal"', note_text)
             self.assertIn('ai_secondary_categories:', note_text)
-            self.assertIn('"category/travel"', note_text)
+            self.assertIn('"category/food/lisbon-portugal"', note_text)
+            self.assertIn('"category/travel/lisbon-portugal"', note_text)
             self.assertIn("## AI Categories", note_text)
 
 

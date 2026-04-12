@@ -40,13 +40,15 @@
   },
   "categorization": {
     "enabled": false,
-    "provider": "openai",
-    "model": "gpt-4o-mini",
-    "api_key_env": "OPENAI_API_KEY",
+    "model": "gemma4:e4b",
+    "base_url": "http://localhost:11434",
+    "temperature": 0,
+    "request_timeout_seconds": 300,
     "taxonomy_file": "./taxonomy.json",
     "overwrite": false,
     "max_input_chars": 8000,
     "fallback_category": "uncategorized",
-    "attach_category_tags": true
+    "attach_category_tags": true,
+    "dynamic_location_categories": ["travel", "food"]
   }
 }

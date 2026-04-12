@@ -35,7 +35,7 @@ class CategoryResult:
     confidence: Optional[float] = None
     reasoning: str = ""
     model: str = ""
-    provider: str = "openai"
+    provider: str = "ollama"
     taxonomy_signature: str = ""
     categorized_at: str = ""
 

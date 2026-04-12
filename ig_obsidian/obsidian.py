@@ -17,6 +17,13 @@ def _slugify_tag(value: str) -> str:
     return collapsed.strip("-")
 
 
+def _category_tag(value: str) -> str:
+    parts = [segment for segment in value.split("/") if segment.strip()]
+    if not parts:
+        return ""
+    return "category/" + "/".join(_slugify_tag(segment) for segment in parts)
+
+
 def _yaml_lines(key: str, value: Any) -> list[str]:
     if value in (None, "", [], {}):
         return []
@@ -169,13 +176,13 @@ def write_notes(posts: list[InstagramPost], config: AppConfig) -> int:
         tags = set(config.obsidian.base_tags)
         tags.update(post.collections)
         if config.categorization.attach_category_tags and post.category_result is not None:
-            primary_slug = _slugify_tag(post.category_result.primary_category)
-            if primary_slug:
-                tags.add(f"category/{primary_slug}")
+            primary_tag = _category_tag(post.category_result.primary_category)
+            if primary_tag:
+                tags.add(primary_tag)
             for category in post.category_result.secondary_categories:
-                secondary_slug = _slugify_tag(category)
-                if secondary_slug:
-                    tags.add(f"category/{secondary_slug}")
+                secondary_tag = _category_tag(category)
+                if secondary_tag:
+                    tags.add(secondary_tag)
         content = "\n\n".join(
             [
                 _frontmatter(post, linked_media, sorted(tags)),

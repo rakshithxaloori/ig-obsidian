@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 
 def _resolve_path(raw: Optional[str], base_dir: Path) -> Optional[Path]:
@@ -13,6 +13,24 @@ def _resolve_path(raw: Optional[str], base_dir: Path) -> Optional[Path]:
     if expanded.is_absolute():
         return expanded
     return (base_dir / expanded).resolve()
+
+
+def _string_list(raw: Any, *, default: Optional[Iterable[str]] = None) -> list[str]:
+    values = raw
+    if values is None:
+        values = list(default or [])
+    if not isinstance(values, list):
+        raise ValueError("Expected a JSON array of strings.")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        value = str(item).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
 
 
 @dataclass
@@ -80,14 +98,18 @@ class MapsConfig:
 @dataclass
 class CategorizationConfig:
     enabled: bool = False
-    provider: str = "openai"
-    model: str = "gpt-4o-mini"
-    api_key_env: str = "OPENAI_API_KEY"
+    model: str = "gemma4:e4b"
+    base_url: str = "http://localhost:11434"
+    temperature: float = 0.0
+    request_timeout_seconds: int = 300
     taxonomy_file: Optional[Path] = None
     overwrite: bool = False
     max_input_chars: int = 8000
     fallback_category: str = "uncategorized"
     attach_category_tags: bool = True
+    dynamic_location_categories: list[str] = field(
+        default_factory=lambda: ["travel", "food"]
+    )
 
 
 @dataclass
@@ -170,14 +192,19 @@ def load_config(config_path: Path) -> AppConfig:
     categorization_raw: Dict[str, Any] = raw.get("categorization", {})
     categorization = CategorizationConfig(
         enabled=bool(categorization_raw.get("enabled", False)),
-        provider=categorization_raw.get("provider", "openai"),
-        model=categorization_raw.get("model", "gpt-4o-mini"),
-        api_key_env=categorization_raw.get("api_key_env", "OPENAI_API_KEY"),
+        model=categorization_raw.get("model", "gemma4:e4b"),
+        base_url=categorization_raw.get("base_url", "http://localhost:11434"),
+        temperature=float(categorization_raw.get("temperature", 0.0)),
+        request_timeout_seconds=int(categorization_raw.get("request_timeout_seconds", 300)),
         taxonomy_file=_resolve_path(categorization_raw.get("taxonomy_file"), base_dir),
         overwrite=bool(categorization_raw.get("overwrite", False)),
         max_input_chars=int(categorization_raw.get("max_input_chars", 8000)),
         fallback_category=categorization_raw.get("fallback_category", "uncategorized"),
         attach_category_tags=bool(categorization_raw.get("attach_category_tags", True)),
+        dynamic_location_categories=_string_list(
+            categorization_raw.get("dynamic_location_categories"),
+            default=["travel", "food"],
+        ),
     )
 
     return AppConfig(

@@ -3,6 +3,3 @@ instaloader>=4.14
 
 # Optional transcription backend used by this project
 faster-whisper>=1.1.0
-
-# Optional AI categorization backend
-openai>=1.0.0
