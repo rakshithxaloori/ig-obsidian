@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime
 import csv
+import io
 import json
 from pathlib import Path
 import sys
@@ -10,7 +12,7 @@ import types
 import unittest
 from unittest import mock
 
-from ig_obsidian.categorize import categorize_posts, load_taxonomy
+from ig_obsidian.categorize import category_error_path, categorize_posts, load_taxonomy
 from ig_obsidian.collections import load_collection_map, normalize_shortcode
 from ig_obsidian.config import (
     AppConfig,
@@ -19,7 +21,7 @@ from ig_obsidian.config import (
     PathsConfig,
     TranscriptionConfig,
 )
-from ig_obsidian.cli import _build_parser, _load_posts
+from ig_obsidian.cli import _build_parser, _format_log_message, _load_posts, main
 from ig_obsidian.instagram import discover_posts, extract_shortcode_from_name
 from ig_obsidian.locations import attach_locations, export_google_maps_csv, load_location_overrides
 from ig_obsidian.models import CategoryResult, InstagramPost
@@ -50,13 +52,50 @@ class CliParsingTest(unittest.TestCase):
                 obsidian=ObsidianConfig(),
             )
 
-            posts = _load_posts(config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                posts = _load_posts(config)
             self.assertEqual(posts, [])
             self.assertTrue(config.paths.archive_dir.exists())
             self.assertTrue(config.paths.vault_dir.exists())
             self.assertTrue(config.paths.notes_path.exists())
             self.assertTrue(config.paths.media_path.exists())
             self.assertTrue(config.paths.exports_path.exists())
+
+
+class CliLoggingTest(unittest.TestCase):
+    def test_format_log_message_includes_timestamp(self) -> None:
+        formatted = _format_log_message("hello")
+        self.assertRegex(
+            formatted,
+            r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\] \[ig-obsidian\] hello$",
+        )
+
+    def test_main_error_output_is_timestamped(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as exc:
+                    main(["build", "--config", "missing-config.json"])
+        self.assertEqual(exc.exception.code, 1)
+        self.assertRegex(
+            stderr.getvalue(),
+            r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\] "
+            r"\[ig-obsidian\] error: Config file not found: .+missing-config\.json.+\n$",
+        )
+
+    def test_main_cancel_output_is_timestamped(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("ig_obsidian.cli.load_config", side_effect=KeyboardInterrupt):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as exc:
+                        main(["build", "--config", "config.json"])
+        self.assertEqual(exc.exception.code, 130)
+        self.assertRegex(
+            stderr.getvalue(),
+            r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\] "
+            r"\[ig-obsidian\] Cancelled by user\.\n$",
+        )
 
 
 class CollectionsTest(unittest.TestCase):
@@ -238,6 +277,135 @@ class CategorizationTest(unittest.TestCase):
             self.assertEqual(posts[0].category_result.primary_category, "travel")
             self.assertEqual(posts[0].category_result.secondary_categories, ["food"])
 
+    def test_categorize_posts_writes_failure_marker_and_continues(self) -> None:
+        class FakeClient:
+            def chat(self, payload: dict[str, object]) -> dict[str, object]:
+                body = payload["messages"][1]["content"]
+                if "Shortcode: BAD123" in body:
+                    return {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "categorize_saved_post",
+                                        "arguments": "",
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                return {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "categorize_saved_post",
+                                    "arguments": {
+                                        "primary_category": "travel",
+                                        "secondary_categories": ["food"],
+                                        "confidence": 0.63,
+                                        "reasoning": "Travel-heavy post with food context.",
+                                    },
+                                }
+                            }
+                        ]
+                    }
+                }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            archive_dir = base / "archive" / "saved"
+            user_dir = archive_dir / "someuser"
+            user_dir.mkdir(parents=True)
+            bad_video = user_dir / "2026-04-08_12-01-02_BAD123.mp4"
+            good_video = user_dir / "2026-04-08_12-01-03_GOOD456.mp4"
+            bad_caption = user_dir / "2026-04-08_12-01-02_BAD123.txt"
+            good_caption = user_dir / "2026-04-08_12-01-03_GOOD456.txt"
+            bad_video.write_bytes(b"bad video")
+            good_video.write_bytes(b"good video")
+            bad_caption.write_text("Bad caption", encoding="utf-8")
+            good_caption.write_text("Good caption", encoding="utf-8")
+
+            taxonomy_path = base / "taxonomy.json"
+            taxonomy_path.write_text(
+                json.dumps({"food": "Restaurants and cafes", "travel": "Destinations"}),
+                encoding="utf-8",
+            )
+            dynamic_roots = ["travel", "food"]
+            taxonomy = load_taxonomy(taxonomy_path, "uncategorized", dynamic_roots)
+            posts = discover_posts(archive_dir, {})
+            progress: list[str] = []
+
+            written = categorize_posts(
+                posts,
+                CategorizationConfig(
+                    enabled=True,
+                    taxonomy_file=taxonomy_path,
+                    fallback_category="uncategorized",
+                    dynamic_location_categories=dynamic_roots,
+                ),
+                taxonomy,
+                progress=progress.append,
+                client=FakeClient(),
+            )
+
+            bad_post = next(post for post in posts if post.shortcode == "BAD123")
+            good_post = next(post for post in posts if post.shortcode == "GOOD456")
+            self.assertEqual(written, 1)
+            self.assertIsNone(bad_post.category_result)
+            self.assertEqual(good_post.category_result.primary_category, "travel")
+            self.assertEqual(
+                category_error_path(bad_post).read_text(encoding="utf-8"),
+                "CategorizationResponseError: Ollama returned empty function-call arguments for categorization.\n",
+            )
+            self.assertTrue(any("Failed BAD123" in message for message in progress))
+            self.assertIn(
+                "Categorization summary: 1 AI category sidecar file(s), 1 failure marker(s).",
+                progress,
+            )
+
+    def test_categorize_posts_skips_existing_failure_marker_on_rerun(self) -> None:
+        class FakeClient:
+            def chat(self, _: dict[str, object]) -> dict[str, object]:
+                raise AssertionError("categorization should be skipped when a failure marker exists")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            archive_dir = base / "archive" / "saved"
+            user_dir = archive_dir / "someuser"
+            user_dir.mkdir(parents=True)
+            video = user_dir / "2026-04-08_12-01-02_BAD123.mp4"
+            caption = user_dir / "2026-04-08_12-01-02_BAD123.txt"
+            video.write_bytes(b"video")
+            caption.write_text("Caption", encoding="utf-8")
+
+            taxonomy_path = base / "taxonomy.json"
+            taxonomy_path.write_text(json.dumps({"travel": "Destinations"}), encoding="utf-8")
+            taxonomy = load_taxonomy(taxonomy_path, "uncategorized", ["travel"])
+            posts = discover_posts(archive_dir, {})
+            error_path = category_error_path(posts[0])
+            error_path.write_text("CategorizationResponseError: broken response\n", encoding="utf-8")
+            progress: list[str] = []
+
+            written = categorize_posts(
+                posts,
+                CategorizationConfig(
+                    enabled=True,
+                    taxonomy_file=taxonomy_path,
+                    fallback_category="uncategorized",
+                    dynamic_location_categories=["travel"],
+                ),
+                taxonomy,
+                progress=progress.append,
+                client=FakeClient(),
+            )
+
+            self.assertEqual(written, 0)
+            self.assertIn(
+                "No posts need AI categorization. Existing category sidecars skipped: 0. Previous failures skipped: 1.",
+                progress,
+            )
+
 
 class InstagramDiscoveryTest(unittest.TestCase):
     def test_extract_shortcode_from_instaloader_filename(self) -> None:
@@ -330,6 +498,23 @@ class InstagramDiscoveryTest(unittest.TestCase):
             self.assertEqual(len(posts), 1)
             self.assertEqual(posts[0].media_files, [video])
             self.assertEqual(posts[0].caption, "Real caption")
+
+    def test_discover_posts_ignores_category_failure_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "saved"
+            author_dir = root / "someuser"
+            author_dir.mkdir(parents=True)
+
+            video = author_dir / "2026-04-08_12-01-02_ABC123.mp4"
+            error_marker = author_dir / "2026-04-08_12-01-02_ABC123.ai_categories.error.txt"
+            video.write_bytes(b"video")
+            error_marker.write_text("CategorizationResponseError: empty arguments\n", encoding="utf-8")
+
+            posts = discover_posts(root, {})
+
+            self.assertEqual(len(posts), 1)
+            self.assertEqual(posts[0].caption, "")
+            self.assertIsNone(posts[0].category_file)
 
 
 class TranscriptionTest(unittest.TestCase):

@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, Optional
 
-from .categorize import CATEGORY_SUFFIX, load_category_result_from_path
+from .categorize import CATEGORY_ERROR_SUFFIX, CATEGORY_SUFFIX, load_category_result_from_path
 from .models import InstagramPost
 
 
@@ -31,7 +31,14 @@ def _is_ignored_archive_path(root: Path, path: Path) -> bool:
 
 
 def _strip_known_suffixes(filename: str) -> str:
-    suffixes = [CATEGORY_SUFFIX, TRANSCRIPT_SUFFIX, *METADATA_SUFFIXES, ".txt", *sorted(MEDIA_EXTENSIONS)]
+    suffixes = [
+        CATEGORY_ERROR_SUFFIX,
+        CATEGORY_SUFFIX,
+        TRANSCRIPT_SUFFIX,
+        *METADATA_SUFFIXES,
+        ".txt",
+        *sorted(MEDIA_EXTENSIONS),
+    ]
     for suffix in sorted(suffixes, key=len, reverse=True):
         if filename.endswith(suffix):
             return filename[: -len(suffix)]
@@ -282,6 +289,9 @@ def discover_posts(root: Path, collection_map: Dict[str, list[str]]) -> list[Ins
 
         if path.name.endswith(TRANSCRIPT_SUFFIX):
             post.transcript_files.append(path)
+            continue
+
+        if path.name.endswith(CATEGORY_ERROR_SUFFIX):
             continue
 
         if path.name.endswith(CATEGORY_SUFFIX):

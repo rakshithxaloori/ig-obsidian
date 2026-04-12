@@ -125,7 +125,9 @@ When categorization is enabled, the tool:
 - classifies into your taxonomy with Ollama tool calling
 - uses dynamic `category/location` values for configured location-aware categories when a place is clear
 - writes a `.ai_categories.json` sidecar next to the source files
+- writes a `.ai_categories.error.txt` marker when Ollama returns malformed per-post output
 - skips already-classified posts on future reruns unless `overwrite` is true
+- skips previous categorization failure markers on future reruns unless `overwrite` is true
 - writes the chosen categories into note frontmatter and an `## AI Categories` section
 
 Categorization uses the local Ollama `/api/chat` endpoint with `think=false` to avoid extra reasoning latency during classification. `categorization.model` defaults to `gemma4:e4b`, and `OLLAMA_MODEL` / `OLLAMA_HOST` override the config at runtime.

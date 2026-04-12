@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,8 +16,13 @@ from .obsidian import write_notes
 from .transcribe import transcribe_posts
 
 
+def _format_log_message(message: str) -> str:
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    return f"[{timestamp}] [ig-obsidian] {message}"
+
+
 def _log(message: str) -> None:
-    print(f"[ig-obsidian] {message}", flush=True)
+    print(_format_log_message(message), flush=True)
 
 
 def _ensure_directories(config: AppConfig) -> None:
@@ -296,8 +302,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             parser.error(f"Unknown command: {args.command}")
     except KeyboardInterrupt:
-        parser.exit(status=130, message="[ig-obsidian] Cancelled by user.\n")
+        parser.exit(status=130, message=_format_log_message("Cancelled by user.") + "\n")
     except (FileNotFoundError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
-        parser.exit(status=1, message=f"error: {exc}\n")
+        parser.exit(status=1, message=_format_log_message(f"error: {exc}") + "\n")
 
     return 0

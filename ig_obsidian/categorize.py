@@ -15,6 +15,7 @@ from .models import CategoryResult, InstagramPost
 
 
 CATEGORY_SUFFIX = ".ai_categories.json"
+CATEGORY_ERROR_SUFFIX = ".ai_categories.error.txt"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_HOST_ENV = "OLLAMA_HOST"
 OLLAMA_MODEL_ENV = "OLLAMA_MODEL"
@@ -29,6 +30,14 @@ class Taxonomy:
     @property
     def names(self) -> list[str]:
         return list(self.categories.keys())
+
+
+class CategorizationRequestError(RuntimeError):
+    """A categorization request could not be completed at all."""
+
+
+class CategorizationResponseError(RuntimeError):
+    """A categorization response was received but was invalid for one post."""
 
 
 def _emit(progress: Optional[Callable[[str], None]], message: str) -> None:
@@ -140,6 +149,17 @@ def category_output_path(post: InstagramPost) -> Optional[Path]:
     return anchor.with_name(f"{base_name}{CATEGORY_SUFFIX}")
 
 
+def category_error_path(post: InstagramPost) -> Optional[Path]:
+    output_path = category_output_path(post)
+    if output_path is None:
+        return None
+    if output_path.name.endswith(CATEGORY_SUFFIX):
+        base_name = output_path.name[: -len(CATEGORY_SUFFIX)]
+    else:
+        base_name = output_path.stem
+    return output_path.with_name(f"{base_name}{CATEGORY_ERROR_SUFFIX}")
+
+
 def load_category_result_from_path(path: Path) -> Optional[CategoryResult]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -185,6 +205,11 @@ def write_category_result(path: Path, result: CategoryResult) -> None:
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def write_category_error(path: Path, exc: Exception) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
 
 
 def _build_post_text(post: InstagramPost, max_input_chars: int) -> str:
@@ -344,7 +369,9 @@ def _send_ollama_chat(
         else:
             raise TypeError("categorization client must be callable or expose a .chat(payload) method.")
         if not isinstance(response, dict):
-            raise TypeError("categorization client must return a dict-shaped Ollama response.")
+            raise CategorizationRequestError(
+                "categorization client must return a dict-shaped Ollama response."
+            )
         return response
 
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -360,30 +387,45 @@ def _send_ollama_chat(
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace").strip()
         message = detail or exc.reason
-        raise RuntimeError(f"Ollama categorization request failed with HTTP {exc.code}: {message}") from exc
+        raise CategorizationRequestError(
+            f"Ollama categorization request failed with HTTP {exc.code}: {message}"
+        ) from exc
     except error.URLError as exc:
-        raise RuntimeError(
+        raise CategorizationRequestError(
             "Could not reach the Ollama server. Start Ollama locally or set OLLAMA_HOST "
             f"(current endpoint: {_chat_endpoint(config)})."
         ) from exc
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Ollama returned invalid JSON for the categorization request.") from exc
+        raise CategorizationRequestError(
+            "Ollama returned invalid JSON for the categorization request."
+        ) from exc
 
 
 def _parse_tool_arguments(arguments: object) -> Dict[str, Any]:
     if isinstance(arguments, dict):
         return arguments
     if isinstance(arguments, str):
-        payload = json.loads(arguments)
+        if not arguments.strip():
+            raise CategorizationResponseError(
+                "Ollama returned empty function-call arguments for categorization."
+            )
+        try:
+            payload = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise CategorizationResponseError(
+                "Ollama returned invalid JSON function-call arguments for categorization."
+            ) from exc
         if isinstance(payload, dict):
             return payload
-    raise RuntimeError("Ollama returned invalid function-call arguments for categorization.")
+    raise CategorizationResponseError("Ollama returned invalid function-call arguments for categorization.")
 
 
 def _extract_categorization_payload(response: Dict[str, Any]) -> Dict[str, Any]:
     message = response.get("message")
     if not isinstance(message, dict):
-        raise RuntimeError("Ollama categorization response did not include a message payload.")
+        raise CategorizationResponseError(
+            "Ollama categorization response did not include a message payload."
+        )
 
     tool_calls = message.get("tool_calls")
     if isinstance(tool_calls, list):
@@ -399,11 +441,18 @@ def _extract_categorization_payload(response: Dict[str, Any]) -> Dict[str, Any]:
 
     content = message.get("content")
     if isinstance(content, str) and content.strip():
-        payload = json.loads(content)
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise CategorizationResponseError(
+                "Ollama returned invalid JSON content for categorization."
+            ) from exc
         if isinstance(payload, dict):
             return payload
 
-    raise RuntimeError("Ollama did not return a categorization function call or JSON response.")
+    raise CategorizationResponseError(
+        "Ollama did not return a categorization function call or JSON response."
+    )
 
 
 def _normalize_category_name(value: object) -> str:
@@ -439,7 +488,7 @@ def _result_from_payload(
 ) -> CategoryResult:
     primary_category = _normalize_category_name(payload.get("primary_category", ""))
     if not _is_allowed_category(primary_category, taxonomy):
-        raise RuntimeError(
+        raise CategorizationResponseError(
             f"Ollama returned an unknown primary category: {primary_category or '<empty>'}."
         )
 
@@ -534,11 +583,13 @@ def categorize_posts(
         _emit(progress, "AI categorization disabled; skipping.")
         return 0
 
-    pending: list[tuple[InstagramPost, Path]] = []
+    pending: list[tuple[InstagramPost, Path, Path]] = []
     skipped_existing = 0
+    skipped_failed = 0
     for post in posts:
         output_path = category_output_path(post)
-        if output_path is None:
+        error_path = category_error_path(post)
+        if output_path is None or error_path is None:
             continue
         existing = post.category_result
         if (
@@ -548,12 +599,19 @@ def categorize_posts(
         ):
             skipped_existing += 1
             continue
-        pending.append((post, output_path))
+        if error_path.exists() and not config.overwrite:
+            skipped_failed += 1
+            continue
+        pending.append((post, output_path, error_path))
 
     if not pending:
         _emit(
             progress,
-            f"No posts need AI categorization. Existing category sidecars skipped: {skipped_existing}.",
+            (
+                "No posts need AI categorization. "
+                f"Existing category sidecars skipped: {skipped_existing}. "
+                f"Previous failures skipped: {skipped_failed}."
+            ),
         )
         return 0
 
@@ -562,15 +620,29 @@ def categorize_posts(
         progress,
         (
             f"Starting AI categorization with ollama:{model_name}. "
-            f"Pending posts: {len(pending)}. Existing category sidecars skipped: {skipped_existing}."
+            f"Pending posts: {len(pending)}. Existing category sidecars skipped: {skipped_existing}. "
+            f"Previous failures skipped: {skipped_failed}."
         ),
     )
     written = 0
-    for index, (post, output_path) in enumerate(pending, start=1):
+    failed = 0
+    for index, (post, output_path, error_path) in enumerate(pending, start=1):
         _emit(progress, f"[{index}/{len(pending)}] Categorizing {post.shortcode}")
-        result = _classify_post_with_ollama(post, config, taxonomy, client=client)
+        try:
+            result = _classify_post_with_ollama(post, config, taxonomy, client=client)
+        except CategorizationResponseError as exc:
+            write_category_error(error_path, exc)
+            failed += 1
+            _emit(
+                progress,
+                f"[{index}/{len(pending)}] Failed {post.shortcode}: {type(exc).__name__}: {exc}",
+            )
+            _emit(progress, f"[{index}/{len(pending)}] Wrote {error_path.name}")
+            continue
         post.category_result = result
         post.category_file = output_path
+        if error_path.exists():
+            error_path.unlink()
         write_category_result(output_path, result)
         written += 1
         _emit(
@@ -578,4 +650,8 @@ def categorize_posts(
             f"[{index}/{len(pending)}] Saved {output_path.name} as {result.primary_category}",
         )
 
+    _emit(
+        progress,
+        f"Categorization summary: {written} AI category sidecar file(s), {failed} failure marker(s).",
+    )
     return written
